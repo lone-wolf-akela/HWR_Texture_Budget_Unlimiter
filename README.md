@@ -9,65 +9,60 @@ Homeworld Remastered 的**纹理内存预算解锁器**（独立 DLL，GPLv3）�
 
 ## 这是什么 / 解决什么问题
 
-Homeworld Remastered（`HomeworldRM.exe`，32 位）的渲染代码里硬编码了一个
-**纹理字节预算 ≈ 1.867 GiB**（`0x77770000`）。所有纹理上传都要经过同一道闸门
-（`FUN_007B4C80`）：累计字节超过该值后，**新纹理创建直接返回 0（静默失败）**。
+Homeworld Remastered（`HomeworldRM.exe`，32 位）的渲染代码里维护了一个
+**纹理字节计数器**，并围绕它做了硬编码的**预算判断（≈1.867 GiB，`0x77770000`）**：
+超过预算后，新纹理创建会**静默返回 0**。
 
 - 原版的 4 个可选种族就已经把这个预算吃到 **99.2%**；
-- 而大型 mod 的 **8 个不同种族**对局，实测贴图需求约 **2.6 GB**；
+- 大型 mod 的 **8 个不同种族**对局，实测贴图需求约 **2.6 GB 以上**；
 - 结果就是大家熟悉的现象：
   - UI 图标变红黑方块（`Unable to retrieve UI (animated) texture (...)`）；
   - 或者加载到必需 UI 贴图时直接弹 **`-- FATAL EXIT --`**
     （`Unable to load texture (data:UI\Pings\Meshes\Circle.mtga)`，`uigraphic.cpp:267`）。
 
-本 DLL 在**游戏启动时**（`se*.dll` 被枚举加载的那一刻）对内存中的这段检查
-做一次 **8 字节补丁**，把整道闸门解除：
+## 原理：计数器巡航下调（不改任何代码/文件）
 
-```asm
-; 补丁前（RVA 0x3B4CF5 起）
-7F 08               jg  fail            ; 计数器高 dword > 0（总量 ≥4GiB）→ 失败
-81 FF 00 00 77 77   cmp edi, 077770000h ; ≈1.867 GiB
-72 09               jb  ok
-; 补丁后
-90 90               nop nop             ; 去掉 4GiB 高位限制
-81 FF FF FF FF FF   cmp edi, 0FFFFFFFFh ; 阈值拉满
-72 09               jb  ok
-```
+游戏启动时会枚举 `<exe目录>\se*.dll` 并 `LoadLibrary` + `GetProcAddress("InspectDLL")`。
+本 DLL 借用这个加载时机（`InspectDLL` 回调里，已脱离 loader lock）做两件事：
 
-为什么两处都要改：**8 个不同种族的纹理总量（含逐级上传的 mip 链，约 1.33×）约 5 GB**，
-只把阈值改大仍然会撞上前面那条"总量 ≥4 GiB 必然失败"的检查（v1.1 的实测就卡在这里）。
+1. **只读校验**目标 exe 是分析过的构建（比对纹理闸门处的 8 字节签名；不匹配就什么都不做）；
+2. 起一个后台线程，**每 250 ms** 读一次引擎那个 64 位纹理计数器（RVA `0x5AED28/0x5AED2C`），
+   只要它超过 **1500 MiB**，就整体**下调 512 MiB**。
 
-- **不修改任何游戏文件**（磁盘上的 exe 原封不动，Steam「验证完整性」不受影响）；
-- 补丁前做**字节签名校验**，游戏版本不匹配时拒绝修改并写日志；
-- 不注册为音频设备（遵守游戏的 `se*.dll` 插件协议，只借用启动时机）。
+为什么这样做是安全的：引擎对这个计数器的所有更新都是"加减 delta"（每张纹理创建时 +size、
+销毁时 −size），**整体平移不会破坏记账**，只是让引擎的各种"快满了"判断始终看到余量。
+
+为什么不用"直接改比较阈值"：我们试过——把闸门里 `CMP EDI,0x77770000` 的阈值改大甚至去掉，
+Steam 正式安装的 8 种族局**仍然**在同一张 `Circle.mtga` 上 `FATAL EXIT`（当时计数器才 ≈1.6 GB）。
+说明除了闸门本身，还有别的基于这个计数器的判断；巡航下调把这一类判断一并覆盖。
+
+**不修改磁盘文件**：所有操作只发生在进程内存里，游戏重启即恢复原状（再加载本 DLL 再执行一次），
+Steam「验证文件完整性」也不会受影响。
 
 ## 安装
 
 1. 把 `se9ccn_texture_budget.dll` 复制到游戏目录：
    `...\Homeworld Remastered Collection\HomeworldRM\bin\Release\`
    （与 `HomeworldRM.exe` 同一目录；游戏会自动加载所有 `se*.dll`）。
-2. 启动游戏。同目录会出现日志 `se9ccn_texture_budget.log`，内容示例：
+2. 启动游戏。同目录会出现日志 `se9ccn_texture_budget.log`，例如：
 
    ```
-   [2026-11-01 22:40:01] se9ccn_texture_budget v1.0.0 starting (Nov  1 2026 22:38:12)
-   [2026-11-01 22:40:01] game exe base = 0x007A0000
-   [2026-11-01 22:40:01] patched: texture budget 0x77770000 (1867 MiB) -> 0xDE800000 (3560 MiB)
+   [2026-11-01 23:05:12] se9ccn_texture_budget v1.3.0 starting (Nov  1 2026 23:04:58)
+   [2026-11-01 23:05:12] game exe base = 0x006E0000
+   [2026-11-01 23:05:12] mechanism: 每 250ms 采样纹理计数器，超过 1500 MiB 就下调 512 MiB
+   [2026-11-01 23:05:12] initial texture counter = 0 MiB
+   [2026-11-01 23:05:12] done: 巡航下调线程已启动。
    ```
-   看到 `patched:` 就说明生效了。
+   进入对局加载时还会看到 `counter shave ...` 与 `engine texture counter ≈ ... MiB` 行。
 
 ## 配置：不需要
 
-**闸门被整体解除，没有预算上限**。本工具不读任何配置文件，装上就生效。
-
-为什么不留参数：贴图加载失败会让游戏**直接不可玩**（丢 UI、甚至 `FATAL EXIT`），
-而显存不足最多只是帧率下降。两者代价不对称，所以默认直接解除。
-2026 年了，4GB 显存已经是底线配置，再让用户为这个开关做选择没有意义。
-
-如果显存确实不够，表现为卡顿/掉帧（而不是丢贴图）——这时应该降低 mod 的贴图分辨率。
+阈值（1500 MiB）与步长（512 MiB）是固定常量，做到"够用且不折腾"；
+要调整的话改 `src/se9ccn_texture_budget.cpp` 顶部的 `kKeepBelowBytes` / `kShaveStepBytes` 重新编译即可。
 
 ## 卸载
 
-删除 `se9ccn_texture_budget.dll`（以及可选的日志 `se9ccn_texture_budget.log`）即可；游戏文件从未被修改。
+删除 `se9ccn_texture_budget.dll`（以及可选的日志）即可；游戏文件从未被修改。
 
 ## 从源码构建
 
@@ -89,10 +84,11 @@ cmake --build build
 
 ## 兼容性与已知限制
 
-- 实测版本：Homeworld Remastered **2.303 / build 3409635**；
-- 其它版本：补丁点做 8 字节签名校验，不匹配则**拒绝修改**并在日志里报错；
-- 只解决"引擎纹理预算"这一道闸门，不解决显存不足、贴图分辨率过高、或 mod 自身 bug；
-- 与其它 `se*.dll` 插件共存，但如果同时有别的工具也在改纹理预算，请只保留一个；
+- 实测版本：Homeworld Remastered **2.303 / build 3409635**（Steam 正式安装）；
+- 其它版本：启动时做 8 字节签名校验，不匹配则**不启用任何功能**并在日志里报错（失败安全）；
+- 只解决"引擎纹理预算"这一道软件闸门，不解决显存不足、贴图分辨率过高、或 mod 自身 bug；
+- 贴图总量超过显存时，驱动会回退到系统内存：表现为变慢/掉帧，而不是丢贴图；
+- 与其它 `se*.dll` 插件共存；如果同时有别的工具也在改纹理预算，请只保留一个；
 - 单人 / 合作 / 局域网 mod 游戏适用；请不要用于任何形式的对抗性场景。
 
 ## 许可
@@ -100,21 +96,25 @@ cmake --build build
 **GNU General Public License v3.0 or later**（GPL-3.0-or-later）。
 完整文本见 [`LICENSE`](LICENSE)。
 
-技术细节（地址、字节、实测数据、为什么这样改）见 [`docs/TECHNICAL.md`](docs/TECHNICAL.md)。
+技术细节（地址、实测数据、方案取舍）见 [`docs/TECHNICAL.md`](docs/TECHNICAL.md)。
 
 ---
 
 ## English
 
-**se9ccn_texture_budget** raises the hard-coded texture memory budget of *Homeworld
-Remastered* (≈1.867 GiB) that makes large mods lose UI textures or die with
-`-- FATAL EXIT --` (`Unable to load texture ... Circle.mtga`, `uigraphic.cpp:267`).
+**se9ccn_texture_budget** works around the hard-coded texture-memory budget of
+*Homeworld Remastered* (≈1.867 GiB) that makes large mods lose UI textures or die
+with `-- FATAL EXIT --` (`Unable to load texture ... Circle.mtga`, `uigraphic.cpp:267`).
 
-The DLL is loaded by the game's own `se*.dll` plugin scan at startup and patches a
-single 4-byte immediate in memory (`cmp edi, 0x77770000` → `cmp edi, <budget>`).
-**No game file is modified**; the patch site is byte-signature-verified and the
-patch is skipped on unknown builds. The budget gate is removed entirely (no cap); there is no configuration file. Log:
-`se9ccn_texture_budget.log` next to the DLL.
+The DLL is loaded by the game's own `se*.dll` plugin scan at startup. It verifies
+the game build with an 8-byte read-only signature check, then starts a background
+thread that samples the engine's 64-bit texture-memory counter every 250 ms and
+subtracts 512 MiB whenever it exceeds 1500 MiB. The counter is only ever updated
+by deltas, so shifting it does not break bookkeeping — it just keeps every
+budget-related check inside the engine from tripping.
+
+**No game file is modified** (the effect is in-process only; a restart resets it).
+Log: `se9ccn_texture_budget.log` next to the DLL.
 
 Install: copy `se9ccn_texture_budget.dll` into `HomeworldRM\bin\Release\`.
 Build: `pwsh -File build.ps1` (32-bit MSVC + CMake). License: GPL-3.0-or-later.
