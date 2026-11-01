@@ -1,0 +1,20 @@
+# 构建产物
+build/
+bin/
+*.dll
+*.lib
+*.exp
+*.obj
+*.pdb
+*.ilk
+*.log
+*.user
+
+# IDE
+.vs/
+*.vcxproj*
+CMakeCache.txt
+CMakeFiles/
+
+# 运行时生成的配置（用户自己的；仓库只保留 .example）
+se9ccn_texture_budget.ini

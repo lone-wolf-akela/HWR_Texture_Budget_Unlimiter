@@ -1,0 +1,13 @@
+# se9ccn_texture_budget.ini —— se9ccn_texture_budget.dll 的配置（可选）
+#
+# budget_mb：新的"纹理字节预算"上限，单位 MiB。
+#   - 默认 3500（≈3.4 GiB），足够 8 个不同种族的 mod 对局（实测需求 ≈2.6 GB）。
+#   - 建议 ≤ 你的显存容量的 70~80%；超过显存会让驱动回退到系统内存，可能卡顿。
+#   - 最大有效值 4095（引擎的计数器高位检查限制在 4 GiB 内）。
+#   - 设为 0 表示不修改游戏（DLL 仍会加载，但什么都不做）。
+#
+# 把本文件改名为 se9ccn_texture_budget.ini 并放在与 DLL 相同的目录（即
+# HomeworldRM\bin\Release\）。不提供该文件时使用默认值 3500。
+
+[sehwr]
+budget_mb=3500
