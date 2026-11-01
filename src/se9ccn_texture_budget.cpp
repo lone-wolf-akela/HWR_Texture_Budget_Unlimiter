@@ -10,15 +10,15 @@
 //   8 个不同种族的 mod 对局需求约 2.6GB+，于是丢 UI 贴图，甚至
 //   "Unable to load texture (...Circle.mtga) -- FATAL EXIT --"（uigraphic.cpp:267）。
 //
-// 本 DLL 怎么做（**计数器巡航下调**，之前已验证可玩的方案）：
-//   游戏启动时被当作 se*.dll 插件加载；我们在 InspectDLL 回调里起一个后台线程，
-//   每 250ms 读一次那个 64 位纹理计数器：只要它超过 1500 MiB，就整体下调 512 MiB，
-//   让引擎各种基于"已用纹理内存"的判断始终看到充裕余量。
+// 本 DLL 怎么做（**一次性把计数器下移 32 GiB**）：
+//   游戏启动时被当作 se*.dll 插件加载；我们在 InspectDLL 回调里把那个 64 位纹理计数器
+//   整体减去 32 GiB。闸门对"负值"一律放行（T<0 → JS 分支，见 docs/TECHNICAL.md），
+//   而 -32 GiB 的偏移远大于一场 8 种族对局的纹理净增量（≈2.6~5GB），整场都不会再拒绝纹理。
 //   - 计数器的更新全部是"加减 delta"，整体平移不会破坏记账；
 //   - 不修改任何代码/磁盘文件：只动进程内一个计数器；
-//   - 为什么不用"改比较指令阈值"：那只绕过闸门里的一处判断；实测 Steam 版 8 种族
-//     在计数器 ≈1.6GB 时仍 FATAL，说明还有别的基于该计数器的判断，巡航下调一并覆盖。
-//
+//   - 写入发生在任何纹理创建之前（无竞争）；每 2 秒的看门狗只在"计数器被重置"这类
+//     异常情况下补一次偏移，正常对局里它永远不会动手。
+
 // 边界：真正决定能否放下的是显存；贴图超出显存时驱动会回退到系统内存（变慢），
 //   但不会再因为"纹理预算"而拒绝创建纹理。
 //
@@ -33,7 +33,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.3.2";
+constexpr const char* kVersion = "1.4.0";
 
 // 版本身份校验：用纹理上传闸门里的那段字节确认这是预期构建（**只读**，不改代码）。
 //   RVA 0x3B4CF7: 81 FF 00 00 77 77 (CMP EDI,0x77770000) 72 09 (JB ok)
@@ -44,9 +44,14 @@ constexpr uint8_t kBuildSig[8] = {0x81, 0xFF, 0x00, 0x00, 0x77, 0x77, 0x72, 0x09
 constexpr uint32_t kTexCounterLowRva = 0x005AED28;
 constexpr uint32_t kTexCounterHighRva = 0x005AED2C;
 
-// 巡航下调参数（与已验证可玩的配置一致）：超过 1500 MiB 就下调 512 MiB。
-constexpr uint64_t kKeepBelowBytes = 1500ull << 20;
-constexpr uint64_t kShaveStepBytes = 512ull << 20;
+// 启动时把计数器整体下移这么多。闸门对"负值"一律放行（见 docs/TECHNICAL.md），
+// 所以只要偏移量远大于一场对局的纹理净增量（8 种族约 2.6~5 GB），整场都不会再触发。
+constexpr uint64_t kOffsetBytes = 32ull << 30;  // 32 GiB
+
+// 低频看门狗：计数器比 -16 GiB 还高（说明被某段代码重置过、或已经爬回来一半）就再下移一次。
+constexpr int64_t kReapplyThreshold = -(16ll << 30);
+constexpr DWORD kWatchdogIntervalMs = 2000;
+
 // 超过这个值就认为是"撕裂读"（64 位计数器分两次读，游戏线程可能正在更新）而不是真实占用。
 constexpr uint64_t kSanityMaxBytes = 64ull << 30;  // 64 GiB
 
@@ -61,7 +66,7 @@ struct PluginInfo {
 
 PluginInfo g_info = {
     "9CCN Texture Budget",
-    "Keeps the engine texture-memory counter below its internal budget thresholds "
+    "Shifts the engine texture-memory counter far below its internal budget thresholds "
     "(in-process only; no game files are modified).",
     "9CCN / GPLv3",
 };
@@ -71,7 +76,7 @@ HANDLE g_log = INVALID_HANDLE_VALUE;
 wchar_t g_dir[MAX_PATH] = {};  // 带尾部反斜杠
 volatile LONG g_init_done = 0;
 uintptr_t g_base = 0;
-volatile LONG g_shaves = 0;
+volatile LONG g_reapplies = 0;
 size_t g_log_bytes = 0;  // 本次运行已写入的字节数（用于 kLogCapBytes 兜底）
 
 void resolve_dir() {
@@ -170,53 +175,44 @@ void write_counter(uint64_t value) {
     *lo = static_cast<uint32_t>(value & 0xFFFFFFFFu);
 }
 
-// 后台巡航：超过阈值就整体下调。线程随 DLL 常驻（DLL 已 PIN）。
-// 注意两点（v1.3.1 修复）：
-//   1) 引擎在纹理销毁时会做减法，被我们下调过的计数器可能变成**负数**——对闸门来说
-//      等于"空间充足"（走 JS 分支），直接跳过即可；
-//   2) 计数器是 64 位、分高低两 dword 读，游戏线程可能正好在中间更新，偶发"半新半旧"
-//      的读值（接近 2^64）。这种值不处理，下一拍再读，避免把真实计数写坏。
-//   下调步数用 O(1) 计算，绝不循环递减（v1.3.0 在遇到异常大值时会空转数分钟）。
-DWORD WINAPI shaver_thread(void* /*param*/) {
-    int64_t last_logged_mb = 0;
-    int negative_logged = 0;
+// 启动时一次性把计数器整体下移（默认 32 GiB）。闸门对"负值"一律放行（T<0 → JS 分支），
+// 只要偏移量大于一场对局的纹理净增量，整场都不会再触发；不需要周期性改写。
+bool apply_offset(const char* why, long long* before_mb, long long* after_mb) {
+    if (g_base == 0) {
+        return false;
+    }
+    const int64_t before = static_cast<int64_t>(read_counter());
+    int64_t target = 0;
+    if (before < INT64_MIN + static_cast<int64_t>(kOffsetBytes)) {
+        target = INT64_MIN + static_cast<int64_t>(kOffsetBytes);  // 防 64 位下溢
+    } else {
+        target = before - static_cast<int64_t>(kOffsetBytes);
+    }
+    write_counter(static_cast<uint64_t>(target));
+    *before_mb = static_cast<long long>(before >> 20);
+    *after_mb = static_cast<long long>(target >> 20);
+    log_line("counter offset applied (%s): %lld MiB -> %lld MiB", why, *before_mb, *after_mb);
+    return true;
+}
+
+// 低频看门狗（每 2 秒）：正常情况下计数器从一个很大的负数慢慢往上爬，正常对局到不了
+// -16 GiB；只有"计数器被某段代码重置"这类异常才会触发它，届时再下移一次。
+DWORD WINAPI watchdog_thread(void* /*param*/) {
     for (;;) {
-        Sleep(250);
-        int64_t counter = static_cast<int64_t>(read_counter());
-        if (counter == 0) {
-            continue;
-        }
-        if (counter < 0) {
-            if (negative_logged < 5) {
-                ++negative_logged;
-                log_line("counter is negative (%lld MiB, shave offset + frees): headroom is huge",
-                         static_cast<long long>(counter >> 20));
-            }
-            continue;
-        }
+        Sleep(kWatchdogIntervalMs);
+        const int64_t counter = static_cast<int64_t>(read_counter());
         if (counter > static_cast<int64_t>(kSanityMaxBytes)) {
-            log_line("skip suspicious counter value %lld MiB (torn read), will retry",
-                     static_cast<long long>(counter >> 20));
+            log_line("skip suspicious counter value (torn read), will retry");
             continue;
         }
-        if (counter >= static_cast<int64_t>(kKeepBelowBytes)) {
-            const int64_t over = counter - static_cast<int64_t>(kKeepBelowBytes);
-            const int64_t steps = over / static_cast<int64_t>(kShaveStepBytes) + 1;
-            const int64_t target = counter - steps * static_cast<int64_t>(kShaveStepBytes);
-            write_counter(static_cast<uint64_t>(target));
-            const LONG n = InterlockedIncrement(&g_shaves);
-            if (n <= 20 || (n % 50) == 0) {
-                log_line("counter shave #%ld: %lld MiB -> %lld MiB", static_cast<long>(n),
-                         static_cast<long long>(counter >> 20),
-                         static_cast<long long>(target >> 20));
+        if (counter > kReapplyThreshold) {
+            long long before = 0;
+            long long after = 0;
+            if (apply_offset("watchdog", &before, &after)) {
+                const LONG n = InterlockedIncrement(&g_reapplies);
+                log_line("watchdog: counter was %lld MiB, re-applied (reapplies=%ld)", before,
+                         static_cast<long>(n));
             }
-            counter = target;
-        }
-        const int64_t mb = counter >> 20;
-        if (mb >= 1024 && mb >= last_logged_mb + 512) {
-            last_logged_mb = mb;
-            log_line("engine texture counter ≈ %lld MiB (shaves so far: %ld)",
-                     static_cast<long long>(mb), static_cast<long>(g_shaves));
         }
     }
     return 0;
@@ -250,17 +246,22 @@ void ensure_initialized() {
         return;
     }
 
-    log_line("mechanism: 每 250ms 采样纹理计数器，超过 %llu MiB 就下调 %llu MiB",
-             static_cast<unsigned long long>(kKeepBelowBytes >> 20),
-             static_cast<unsigned long long>(kShaveStepBytes >> 20));
-    log_line("initial texture counter = %llu MiB",
-             static_cast<unsigned long long>(read_counter() >> 20));
+    log_line("mechanism: 启动时把纹理计数器整体下移 %lld MiB（一次写入），之后每 %lu ms 由看门狗兜底",
+             static_cast<long long>(kOffsetBytes >> 20),
+             static_cast<unsigned long>(kWatchdogIntervalMs));
 
-    if (CreateThread(nullptr, 0, &shaver_thread, nullptr, 0, nullptr) == nullptr) {
+    long long before_mb = 0;
+    long long after_mb = 0;
+    if (!apply_offset("startup", &before_mb, &after_mb)) {
+        log_line("error: failed to apply counter offset");
+        return;
+    }
+
+    if (CreateThread(nullptr, 0, &watchdog_thread, nullptr, 0, nullptr) == nullptr) {
         log_line("error: CreateThread failed (err=%lu)", GetLastError());
         return;
     }
-    log_line("done: 巡航下调线程已启动。");
+    log_line("done: 看门狗线程已启动（正常对局不会触发）。");
 }
 
 }  // namespace

@@ -20,21 +20,27 @@ Homeworld Remastered（`HomeworldRM.exe`，32 位）的渲染代码里维护了�
   - 或者加载到必需 UI 贴图时直接弹 **`-- FATAL EXIT --`**
     （`Unable to load texture (data:UI\Pings\Meshes\Circle.mtga)`，`uigraphic.cpp:267`）。
 
-## 原理：计数器巡航下调（不改任何代码/文件）
+## 原理：启动时把计数器一次性下移 32 GiB（不改任何代码/文件）
 
 游戏启动时会枚举 `<exe目录>\se*.dll` 并 `LoadLibrary` + `GetProcAddress("InspectDLL")`。
 本 DLL 借用这个加载时机（`InspectDLL` 回调里，已脱离 loader lock）做两件事：
 
 1. **只读校验**目标 exe 是分析过的构建（比对纹理闸门处的 8 字节签名；不匹配就什么都不做）；
-2. 起一个后台线程，**每 250 ms** 读一次引擎那个 64 位纹理计数器（RVA `0x5AED28/0x5AED2C`），
-   只要它超过 **1500 MiB**，就整体**下调 512 MiB**。
+2. 把引擎那个 64 位纹理计数器（RVA `0x5AED28/0x5AED2C`）**整体减去 32 GiB**。
+
+为什么这样就够了：闸门对计数器的判断是"**负数 → 无条件放行**"（`T < 0` 走 `JS` 分支，
+详见 `docs/TECHNICAL.md`）。一次下移 32 GiB 后，计数器要净增 ≈34 GiB 纹理才会重新进入
+"拒绝区"，而 8 个不同种族一场也就 2.6~5 GB —— 所以整场都不会再拒绝纹理。写入发生在任何
+纹理创建之前（无竞争），不需要反复改写。
+
+一个 **2 秒一次的低频看门狗**只在"计数器被重置/爬回来"这类异常时补一次偏移，正常对局不会触发。
 
 为什么这样做是安全的：引擎对这个计数器的所有更新都是"加减 delta"（每张纹理创建时 +size、
 销毁时 −size），**整体平移不会破坏记账**，只是让引擎的各种"快满了"判断始终看到余量。
 
 为什么不用"直接改比较阈值"：我们试过——把闸门里 `CMP EDI,0x77770000` 的阈值改大甚至去掉，
 Steam 正式安装的 8 种族局**仍然**在同一张 `Circle.mtga` 上 `FATAL EXIT`（当时计数器才 ≈1.6 GB）。
-说明除了闸门本身，还有别的基于这个计数器的判断；巡航下调把这一类判断一并覆盖。
+说明除了闸门本身，还有别的基于这个计数器的判断；整体下移把这一类判断一并覆盖。
 
 **不修改磁盘文件**：所有操作只发生在进程内存里，游戏重启即恢复原状（再加载本 DLL 再执行一次），
 Steam「验证文件完整性」也不会受影响。
@@ -47,20 +53,20 @@ Steam「验证文件完整性」也不会受影响。
 2. 启动游戏。同目录会出现日志 `se9ccn_texture_budget.log`，例如：
 
    ```
-   [2026-11-01 23:09:23] se9ccn_texture_budget v1.3.1 starting (Nov  1 2026 23:09:19)
-   [2026-11-01 23:09:23] game exe base = 0x006E0000
-   [2026-11-01 23:09:23] mechanism: 每 250ms 采样纹理计数器，超过 1500 MiB 就下调 512 MiB
-   [2026-11-01 23:09:23] initial texture counter = 0 MiB
-   [2026-11-01 23:09:23] done: 巡航下调线程已启动。
+   [2026-11-01 23:25:01] se9ccn_texture_budget v1.4.0 starting (Nov  1 2026 23:24:58)
+   [2026-11-01 23:25:01] game exe base = 0x006E0000
+   [2026-11-01 23:25:01] mechanism: 启动时把纹理计数器整体下移 32768 MiB（一次写入），之后每 2000 ms 由看门狗兜底
+   [2026-11-01 23:25:01] counter offset applied (startup): 0 MiB -> -32768 MiB
+   [2026-11-01 23:25:01] done: 看门狗线程已启动（正常对局不会触发）。
    ```
-   进入对局加载时还会看到 `counter shave ...` 与 `engine texture counter ≈ ... MiB` 行。
+   进入对局后正常不会有额外日志（看门狗只在异常时补偏移）。
 
    **日志每次都重写**（不会随游玩次数增长），并且单次运行最多 256 KB。
 
 ## 配置：不需要
 
-阈值（1500 MiB）与步长（512 MiB）是固定常量，做到"够用且不折腾"；
-要调整的话改 `src/se9ccn_texture_budget.cpp` 顶部的 `kKeepBelowBytes` / `kShaveStepBytes` 重新编译即可。
+偏移量（32 GiB）与看门狗阈值（-16 GiB）是固定常量；
+要调整的话改 `src/se9ccn_texture_budget.cpp` 顶部的 `kOffsetBytes` / `kReapplyThreshold` 重新编译即可。
 
 ## 卸载
 
@@ -113,11 +119,12 @@ cmake --build build
 with `-- FATAL EXIT --` (`Unable to load texture ... Circle.mtga`, `uigraphic.cpp:267`).
 
 The DLL is loaded by the game's own `se*.dll` plugin scan at startup. It verifies
-the game build with an 8-byte read-only signature check, then starts a background
-thread that samples the engine's 64-bit texture-memory counter every 250 ms and
-subtracts 512 MiB whenever it exceeds 1500 MiB. The counter is only ever updated
-by deltas, so shifting it does not break bookkeeping — it just keeps every
-budget-related check inside the engine from tripping.
+the game build with an 8-byte read-only signature check, then subtracts 32 GiB
+from the engine's 64-bit texture-memory counter exactly once. The gate treats any
+negative counter as "plenty of space", and 32 GiB is far more than a large mod
+match consumes (≈2.6–5 GB), so no texture is ever rejected. A 2-second watchdog
+only re-applies the offset if the counter is ever reset. The counter is updated
+by deltas only, so shifting it does not break bookkeeping.
 
 **No game file is modified** (the effect is in-process only; a restart resets it).
 Log: `se9ccn_texture_budget.log` next to the DLL.
