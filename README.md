@@ -20,17 +20,22 @@ Homeworld Remastered（`HomeworldRM.exe`，32 位）的渲染代码里硬编码�
   - 或者加载到必需 UI 贴图时直接弹 **`-- FATAL EXIT --`**
     （`Unable to load texture (data:UI\Pings\Meshes\Circle.mtga)`，`uigraphic.cpp:267`）。
 
-本 DLL 在**游戏启动时**（`se*.dll` 被枚举加载的那一刻）对内存中的那一条比较指令
-做一次 **4 字节补丁**，把上限改成**引擎允许的最大值**（`0xFFF00000` ≈ **4095 MiB**）：
+本 DLL 在**游戏启动时**（`se*.dll` 被枚举加载的那一刻）对内存中的这段检查
+做一次 **8 字节补丁**，把整道闸门解除：
 
 ```asm
-; 补丁前
-81 FF 00 00 77 77   cmp edi, 077770000h   ; ≈1.867 GiB
-72 09               jb  ok                 ; 小于上限就继续
-; 补丁后（imm32 被改为 0FFF00000h）
-81 FF 00 00 F0 FF   cmp edi, 0FFF00000h  ; ≈4095 MiB（引擎上限）
+; 补丁前（RVA 0x3B4CF5 起）
+7F 08               jg  fail            ; 计数器高 dword > 0（总量 ≥4GiB）→ 失败
+81 FF 00 00 77 77   cmp edi, 077770000h ; ≈1.867 GiB
+72 09               jb  ok
+; 补丁后
+90 90               nop nop             ; 去掉 4GiB 高位限制
+81 FF FF FF FF FF   cmp edi, 0FFFFFFFFh ; 阈值拉满
 72 09               jb  ok
 ```
+
+为什么两处都要改：**8 个不同种族的纹理总量（含逐级上传的 mip 链，约 1.33×）约 5 GB**，
+只把阈值改大仍然会撞上前面那条"总量 ≥4 GiB 必然失败"的检查（v1.1 的实测就卡在这里）。
 
 - **不修改任何游戏文件**（磁盘上的 exe 原封不动，Steam「验证完整性」不受影响）；
 - 补丁前做**字节签名校验**，游戏版本不匹配时拒绝修改并写日志；
@@ -52,15 +57,13 @@ Homeworld Remastered（`HomeworldRM.exe`，32 位）的渲染代码里硬编码�
 
 ## 配置：不需要
 
-预算**固定为引擎允许的最大值**（`0xFFF00000` ≈ 4095 MiB；再大就会撞上引擎 4 GiB 的高位检查）。
-本工具不读任何配置文件，装上就生效。
+**闸门被整体解除，没有预算上限**。本工具不读任何配置文件，装上就生效。
 
 为什么不留参数：贴图加载失败会让游戏**直接不可玩**（丢 UI、甚至 `FATAL EXIT`），
-而显存不足最多只是帧率下降。两者代价不对称，所以默认直接给到上限。
+而显存不足最多只是帧率下降。两者代价不对称，所以默认直接解除。
 2026 年了，4GB 显存已经是底线配置，再让用户为这个开关做选择没有意义。
 
-如果显存确实不够，表现为卡顿/掉帧（而不是丢贴图）——这时应该降低 mod 的贴图分辨率，
-而不是把预算调小。
+如果显存确实不够，表现为卡顿/掉帧（而不是丢贴图）——这时应该降低 mod 的贴图分辨率。
 
 ## 卸载
 
@@ -110,8 +113,7 @@ Remastered* (≈1.867 GiB) that makes large mods lose UI textures or die with
 The DLL is loaded by the game's own `se*.dll` plugin scan at startup and patches a
 single 4-byte immediate in memory (`cmp edi, 0x77770000` → `cmp edi, <budget>`).
 **No game file is modified**; the patch site is byte-signature-verified and the
-patch is skipped on unknown builds. The budget is fixed to the engine maximum
-(0xFFF00000 ≈ 4095 MiB); there is no configuration file. Log:
+patch is skipped on unknown builds. The budget gate is removed entirely (no cap); there is no configuration file. Log:
 `se9ccn_texture_budget.log` next to the DLL.
 
 Install: copy `se9ccn_texture_budget.dll` into `HomeworldRM\bin\Release\`.
