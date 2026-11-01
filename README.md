@@ -47,11 +47,11 @@ Steam「验证文件完整性」也不会受影响。
 2. 启动游戏。同目录会出现日志 `se9ccn_texture_budget.log`，例如：
 
    ```
-   [2026-11-01 23:05:12] se9ccn_texture_budget v1.3.0 starting (Nov  1 2026 23:04:58)
-   [2026-11-01 23:05:12] game exe base = 0x006E0000
-   [2026-11-01 23:05:12] mechanism: 每 250ms 采样纹理计数器，超过 1500 MiB 就下调 512 MiB
-   [2026-11-01 23:05:12] initial texture counter = 0 MiB
-   [2026-11-01 23:05:12] done: 巡航下调线程已启动。
+   [2026-11-01 23:09:23] se9ccn_texture_budget v1.3.1 starting (Nov  1 2026 23:09:19)
+   [2026-11-01 23:09:23] game exe base = 0x006E0000
+   [2026-11-01 23:09:23] mechanism: 每 250ms 采样纹理计数器，超过 1500 MiB 就下调 512 MiB
+   [2026-11-01 23:09:23] initial texture counter = 0 MiB
+   [2026-11-01 23:09:23] done: 巡航下调线程已启动。
    ```
    进入对局加载时还会看到 `counter shave ...` 与 `engine texture counter ≈ ... MiB` 行。
 

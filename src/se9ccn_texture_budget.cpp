@@ -33,7 +33,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.3.0";
+constexpr const char* kVersion = "1.3.1";
 
 // 版本身份校验：用纹理上传闸门里的那段字节确认这是预期构建（**只读**，不改代码）。
 //   RVA 0x3B4CF7: 81 FF 00 00 77 77 (CMP EDI,0x77770000) 72 09 (JB ok)
@@ -47,6 +47,8 @@ constexpr uint32_t kTexCounterHighRva = 0x005AED2C;
 // 巡航下调参数（与已验证可玩的配置一致）：超过 1500 MiB 就下调 512 MiB。
 constexpr uint64_t kKeepBelowBytes = 1500ull << 20;
 constexpr uint64_t kShaveStepBytes = 512ull << 20;
+// 超过这个值就认为是"撕裂读"（64 位计数器分两次读，游戏线程可能正在更新）而不是真实占用。
+constexpr uint64_t kSanityMaxBytes = 64ull << 30;  // 64 GiB
 
 struct PluginInfo {
     char name[32];
@@ -162,33 +164,52 @@ void write_counter(uint64_t value) {
 }
 
 // 后台巡航：超过阈值就整体下调。线程随 DLL 常驻（DLL 已 PIN）。
+// 注意两点（v1.3.1 修复）：
+//   1) 引擎在纹理销毁时会做减法，被我们下调过的计数器可能变成**负数**——对闸门来说
+//      等于"空间充足"（走 JS 分支），直接跳过即可；
+//   2) 计数器是 64 位、分高低两 dword 读，游戏线程可能正好在中间更新，偶发"半新半旧"
+//      的读值（接近 2^64）。这种值不处理，下一拍再读，避免把真实计数写坏。
+//   下调步数用 O(1) 计算，绝不循环递减（v1.3.0 在遇到异常大值时会空转数分钟）。
 DWORD WINAPI shaver_thread(void* /*param*/) {
-    uint64_t last_logged_mb = 0;
+    int64_t last_logged_mb = 0;
+    int negative_logged = 0;
     for (;;) {
         Sleep(250);
-        uint64_t counter = read_counter();
+        int64_t counter = static_cast<int64_t>(read_counter());
         if (counter == 0) {
             continue;
         }
-        if (counter >= kKeepBelowBytes) {
-            uint64_t target = counter;
-            while (target >= kKeepBelowBytes) {
-                target -= kShaveStepBytes;
+        if (counter < 0) {
+            if (negative_logged < 5) {
+                ++negative_logged;
+                log_line("counter is negative (%lld MiB, shave offset + frees): headroom is huge",
+                         static_cast<long long>(counter >> 20));
             }
-            write_counter(target);
+            continue;
+        }
+        if (counter > static_cast<int64_t>(kSanityMaxBytes)) {
+            log_line("skip suspicious counter value %lld MiB (torn read), will retry",
+                     static_cast<long long>(counter >> 20));
+            continue;
+        }
+        if (counter >= static_cast<int64_t>(kKeepBelowBytes)) {
+            const int64_t over = counter - static_cast<int64_t>(kKeepBelowBytes);
+            const int64_t steps = over / static_cast<int64_t>(kShaveStepBytes) + 1;
+            const int64_t target = counter - steps * static_cast<int64_t>(kShaveStepBytes);
+            write_counter(static_cast<uint64_t>(target));
             const LONG n = InterlockedIncrement(&g_shaves);
             if (n <= 20 || (n % 50) == 0) {
-                log_line("counter shave #%ld: %llu MiB -> %llu MiB", static_cast<long>(n),
-                         static_cast<unsigned long long>(counter >> 20),
-                         static_cast<unsigned long long>(target >> 20));
+                log_line("counter shave #%ld: %lld MiB -> %lld MiB", static_cast<long>(n),
+                         static_cast<long long>(counter >> 20),
+                         static_cast<long long>(target >> 20));
             }
             counter = target;
         }
-        const uint64_t mb = counter >> 20;
-        if (mb >= 1024 && mb >= last_logged_mb + 512 && mb < 65536) {
+        const int64_t mb = counter >> 20;
+        if (mb >= 1024 && mb >= last_logged_mb + 512) {
             last_logged_mb = mb;
-            log_line("engine texture counter ≈ %llu MiB (shaves so far: %ld)",
-                     static_cast<unsigned long long>(mb), static_cast<long>(g_shaves));
+            log_line("engine texture counter ≈ %lld MiB (shaves so far: %ld)",
+                     static_cast<long long>(mb), static_cast<long>(g_shaves));
         }
     }
     return 0;
