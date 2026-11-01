@@ -33,7 +33,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.4.0";
+constexpr const char* kVersion = "1.4.1";
 
 // 版本身份校验：用纹理上传闸门里的那段字节确认这是预期构建（**只读**，不改代码）。
 //   RVA 0x3B4CF7: 81 FF 00 00 77 77 (CMP EDI,0x77770000) 72 09 (JB ok)
