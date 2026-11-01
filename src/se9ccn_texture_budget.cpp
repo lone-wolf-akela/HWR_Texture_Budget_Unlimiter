@@ -33,7 +33,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.3.1";
+constexpr const char* kVersion = "1.3.2";
 
 // 版本身份校验：用纹理上传闸门里的那段字节确认这是预期构建（**只读**，不改代码）。
 //   RVA 0x3B4CF7: 81 FF 00 00 77 77 (CMP EDI,0x77770000) 72 09 (JB ok)
@@ -49,6 +49,9 @@ constexpr uint64_t kKeepBelowBytes = 1500ull << 20;
 constexpr uint64_t kShaveStepBytes = 512ull << 20;
 // 超过这个值就认为是"撕裂读"（64 位计数器分两次读，游戏线程可能正在更新）而不是真实占用。
 constexpr uint64_t kSanityMaxBytes = 64ull << 30;  // 64 GiB
+
+// 单次运行的日志上限：正常情况下几十行就够，这里只做兜底，避免极端长局把日志写爆。
+constexpr size_t kLogCapBytes = 256 * 1024;
 
 struct PluginInfo {
     char name[32];
@@ -69,6 +72,7 @@ wchar_t g_dir[MAX_PATH] = {};  // 带尾部反斜杠
 volatile LONG g_init_done = 0;
 uintptr_t g_base = 0;
 volatile LONG g_shaves = 0;
+size_t g_log_bytes = 0;  // 本次运行已写入的字节数（用于 kLogCapBytes 兜底）
 
 void resolve_dir() {
     wchar_t path[MAX_PATH] = {};
@@ -101,12 +105,14 @@ void open_log() {
     wchar_t path[MAX_PATH] = {};
     lstrcpynW(path, g_dir, MAX_PATH);
     lstrcatW(path, L"se9ccn_texture_budget.log");
+    // CREATE_ALWAYS：每次启动重写日志，避免多次游戏后日志无限增长。
     g_log = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    g_log_bytes = 0;
 }
 
 void log_line(const char* fmt, ...) {
-    if (g_log == INVALID_HANDLE_VALUE) {
+    if (g_log == INVALID_HANDLE_VALUE || g_log_bytes >= kLogCapBytes) {
         return;
     }
     char buf[1024] = {};
@@ -131,6 +137,7 @@ void log_line(const char* fmt, ...) {
     buf[n++] = '\n';
     DWORD written = 0;
     WriteFile(g_log, buf, static_cast<DWORD>(n), &written, nullptr);
+    g_log_bytes += static_cast<size_t>(written);
 }
 
 // 只读校验：确认目标 exe 是我们分析过的构建（不修改任何字节）。

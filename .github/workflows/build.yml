@@ -1,0 +1,50 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (Win32 / Release)
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A Win32
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Verify artifact is 32-bit PE
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path build -Recurse -Filter se9ccn_texture_budget.dll | Select-Object -First 1
+          if (-not $dll) { throw 'se9ccn_texture_budget.dll not found' }
+          $bytes = [IO.File]::ReadAllBytes($dll.FullName)
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw 'not a PE (no MZ)' }
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+          if ($machine -ne 0x014C) { throw ('not x86 machine: 0x{0:X4}' -f $machine) }
+          Write-Host ("OK: {0} ({1} bytes, PE machine 0x{2:X4})" -f $dll.Name, $dll.Length, $machine)
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: se9ccn_texture_budget-x86
+          path: build/bin/se9ccn_texture_budget.dll
+          if-no-files-found: error
+
+      - name: Attach DLL to GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/bin/se9ccn_texture_budget.dll
+          generate_release_notes: true

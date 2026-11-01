@@ -55,6 +55,8 @@ Steam「验证文件完整性」也不会受影响。
    ```
    进入对局加载时还会看到 `counter shave ...` 与 `engine texture counter ≈ ... MiB` 行。
 
+   **日志每次都重写**（不会随游玩次数增长），并且单次运行最多 256 KB。
+
 ## 配置：不需要
 
 阈值（1500 MiB）与步长（512 MiB）是固定常量，做到"够用且不折腾"；
@@ -81,6 +83,10 @@ cmake --build build
 ```
 
 产物在 `build/bin/se9ccn_texture_budget.dll`。必须是 **x86（32 位）** 构建。
+
+仓库自带 GitHub Actions（`.github/workflows/build.yml`）：
+- push / PR → 自动构建 x86 DLL 并校验 PE machine，产物作为 Artifact 上传；
+- 推送 `v*` tag → 自动创建 GitHub Release 并把 DLL 作为附件上传。
 
 ## 兼容性与已知限制
 
