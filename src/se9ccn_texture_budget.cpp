@@ -13,15 +13,18 @@
 // 本 DLL 做什么：
 //   游戏启动时会枚举 <exe目录>\se*.dll 并 LoadLibrary + GetProcAddress("InspectDLL")，
 //   我们在被加载的这一瞬间（InspectDLL 回调里，已脱离 loader lock）对**内存中的代码**
-//   做一次 4 字节补丁：把 `CMP EDI, 0x77770000` 的立即数改成配置的预算（默认 3500MB）。
+//   做一次 4 字节补丁：把 `CMP EDI, 0x77770000` 的立即数改成**允许的最大值**
+//   （0xFFF00000，约 4095 MiB；再大就会撞上引擎的 4 GiB 高位检查）。
 //   - 不修改任何游戏文件（磁盘上的 exe 原封不动）；
 //   - 补丁前做字节签名校验，游戏版本不匹配时拒绝修改并写日志；
 //   - 计数器语义不变（仍是"已用纹理字节"），只是上限变大。
 //
-// 安全/边界：
-//   - 计数器高位检查仍存在，所以有效上限 < 4 GiB；我们把 cap 钳到 0xFFF00000。
-//   - 预算应设为你的显存能从容容纳的大小（建议显存 70~80%），过大只会让驱动去用系统内存，
-//     反而可能卡顿。
+// 为什么直接拉满、不留配置：
+//   贴图加载失败会让游戏直接不可玩（丢 UI、FATAL EXIT）；而显存不足最多只是帧率下降。
+//   两者代价不对称，所以默认就给到引擎允许的最大预算，不需要用户做选择。
+//
+// 边界：计数器高位检查仍存在，总量 ≥ 4 GiB 时会走另一条失败路径；
+//   本工具的 cap（0xFFF00000 ≈ 4095 MiB）是这条路上能给出的最大值。
 //
 // 构建：见 README.md（CMake + 32 位 MSVC，静态 CRT）。
 
@@ -31,11 +34,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <string>
 
 namespace {
 
-constexpr const char* kVersion = "1.0.0";
+constexpr const char* kVersion = "1.1.0";
 
 // 补丁位置：VA 0x7B4CF7（preferred base 0x400000）处的一条指令
 //   81 FF 00 00 77 77   CMP EDI, 0x77770000
@@ -43,10 +45,8 @@ constexpr const char* kVersion = "1.0.0";
 // 我们把 imm32（+2 处）改成新的预算值。
 constexpr uint32_t kCmpSiteRva = 0x003B4CF7;
 constexpr uint32_t kOriginalCap = 0x77770000u;
-// 计数器高位检查：总量 ≥ 4GiB 时会走另一条失败路径，因此有效上限必须 < 4GiB。
-constexpr uint32_t kHardCeiling = 0xFFF00000u;
-constexpr uint32_t kDefaultBudgetMb = 3500;
-constexpr uint32_t kMinBudgetMb = 64;
+// 引擎的计数器高位检查把总量限制在 4 GiB 内；0xFFF00000（4095 MiB）是允许的最大值。
+constexpr uint32_t kCapBytes = 0xFFF00000u;
 
 struct PluginInfo {
     char name[32];
@@ -129,17 +129,6 @@ void log_line(const char* fmt, ...) {
     WriteFile(g_log, buf, static_cast<DWORD>(n), &written, nullptr);
 }
 
-uint32_t read_budget_mb() {
-    if (g_dir[0] == 0) {
-        return kDefaultBudgetMb;
-    }
-    wchar_t ini[MAX_PATH] = {};
-    lstrcpynW(ini, g_dir, MAX_PATH);
-    lstrcatW(ini, L"se9ccn_texture_budget.ini");
-    return static_cast<uint32_t>(
-        GetPrivateProfileIntW(L"sehwr", L"budget_mb", static_cast<INT>(kDefaultBudgetMb), ini));
-}
-
 // 只在目标位置字节符合预期时才下补丁。函数内不做堆分配，便于在 __try 中安全使用。
 bool patch_cmp_immediate(uintptr_t base, uint32_t cap) {
     static const uint8_t kExpected[8] = {0x81, 0xFF, 0x00, 0x00, 0x77, 0x77, 0x72, 0x09};
@@ -188,15 +177,7 @@ void ensure_initialized() {
     }
     log_line("game exe base = 0x%08X", static_cast<unsigned>(base));
 
-    const uint32_t mb = read_budget_mb();
-    if (mb == 0) {
-        log_line("disabled: se9ccn_texture_budget.ini sets budget_mb=0");
-        return;
-    }
-    const uint32_t mb_clamped = (mb < kMinBudgetMb) ? kMinBudgetMb : mb;
-    const uint64_t wanted = static_cast<uint64_t>(mb_clamped) * 1024ull * 1024ull;
-    const uint32_t cap =
-        (wanted >= kHardCeiling) ? kHardCeiling : static_cast<uint32_t>(wanted);
+    const uint32_t cap = kCapBytes;
 
     if (!patch_cmp_immediate(base, cap)) {
         log_line("error: signature mismatch at RVA 0x%08X —— 游戏版本不匹配或已被其它补丁修改，"
@@ -208,7 +189,7 @@ void ensure_initialized() {
     log_line("patched: texture budget 0x%08X (%.0f MiB) -> 0x%08X (%.0f MiB)",
              static_cast<unsigned>(kOriginalCap), kOriginalCap / 1048576.0, static_cast<unsigned>(cap),
              cap / 1048576.0);
-    log_line("done. If you see texture losses still, lower budget_mb or check VRAM.");
+    log_line("done: 预算已拉到引擎允许的最大值。显存不足只会掉帧，不再丢贴图。");
 }
 
 }  // namespace

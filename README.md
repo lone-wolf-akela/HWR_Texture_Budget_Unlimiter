@@ -21,14 +21,14 @@ Homeworld Remastered（`HomeworldRM.exe`，32 位）的渲染代码里硬编码�
     （`Unable to load texture (data:UI\Pings\Meshes\Circle.mtga)`，`uigraphic.cpp:267`）。
 
 本 DLL 在**游戏启动时**（`se*.dll` 被枚举加载的那一刻）对内存中的那一条比较指令
-做一次 **4 字节补丁**，把上限改成可配置值（默认 **3500 MiB**）：
+做一次 **4 字节补丁**，把上限改成**引擎允许的最大值**（`0xFFF00000` ≈ **4095 MiB**）：
 
 ```asm
 ; 补丁前
 81 FF 00 00 77 77   cmp edi, 077770000h   ; ≈1.867 GiB
 72 09               jb  ok                 ; 小于上限就继续
-; 补丁后（imm32 被改为 budget_mb）
-81 FF xx xx xx xx   cmp edi, <budget>
+; 补丁后（imm32 被改为 0FFF00000h）
+81 FF 00 00 F0 FF   cmp edi, 0FFF00000h  ; ≈4095 MiB（引擎上限）
 72 09               jb  ok
 ```
 
@@ -50,26 +50,21 @@ Homeworld Remastered（`HomeworldRM.exe`，32 位）的渲染代码里硬编码�
    ```
    看到 `patched:` 就说明生效了。
 
-## 配置（可选）
+## 配置：不需要
 
-把 `se9ccn_texture_budget.ini.example` 改名为 `se9ccn_texture_budget.ini`，放在 DLL 同目录：
+预算**固定为引擎允许的最大值**（`0xFFF00000` ≈ 4095 MiB；再大就会撞上引擎 4 GiB 的高位检查）。
+本工具不读任何配置文件，装上就生效。
 
-```ini
-[sehwr]
-budget_mb=3500
-```
+为什么不留参数：贴图加载失败会让游戏**直接不可玩**（丢 UI、甚至 `FATAL EXIT`），
+而显存不足最多只是帧率下降。两者代价不对称，所以默认直接给到上限。
+2026 年了，4GB 显存已经是底线配置，再让用户为这个开关做选择没有意义。
 
-- 默认 3500 MiB；**建议 ≤ 显存的 70~80%**（例：4GB 显存用 2800~3000，8GB 用 4095）；
-- 设为 `0` 表示不修改游戏（只加载、什么都不做）；
-- 最大有效值 4095 MiB（引擎的计数器高位检查把总量限制在 4 GiB 内）。
-
-**关于显存**：本工具只抬高"纹理字节预算"这一道软件闸门，不会凭空多出显存。
-如果 mod 的贴图总量超过显存，驱动会回退到系统内存，表现为卡顿甚至更糟；
-这时应该调整 mod 的贴图分辨率，而不是继续加预算。
+如果显存确实不够，表现为卡顿/掉帧（而不是丢贴图）——这时应该降低 mod 的贴图分辨率，
+而不是把预算调小。
 
 ## 卸载
 
-删除 `se9ccn_texture_budget.dll`（以及可选的 ini/日志）即可；游戏文件从未被修改。
+删除 `se9ccn_texture_budget.dll`（以及可选的日志 `se9ccn_texture_budget.log`）即可；游戏文件从未被修改。
 
 ## 从源码构建
 
@@ -115,8 +110,9 @@ Remastered* (≈1.867 GiB) that makes large mods lose UI textures or die with
 The DLL is loaded by the game's own `se*.dll` plugin scan at startup and patches a
 single 4-byte immediate in memory (`cmp edi, 0x77770000` → `cmp edi, <budget>`).
 **No game file is modified**; the patch site is byte-signature-verified and the
-patch is skipped on unknown builds. Default budget: 3500 MiB (configurable via
-`se9ccn_texture_budget.ini`). Log: `se9ccn_texture_budget.log` next to the DLL.
+patch is skipped on unknown builds. The budget is fixed to the engine maximum
+(0xFFF00000 ≈ 4095 MiB); there is no configuration file. Log:
+`se9ccn_texture_budget.log` next to the DLL.
 
 Install: copy `se9ccn_texture_budget.dll` into `HomeworldRM\bin\Release\`.
 Build: `pwsh -File build.ps1` (32-bit MSVC + CMake). License: GPL-3.0-or-later.
